@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""A status board on disk for the tools that run next to your AI agents.
+
+Each tool writes one small JSON file per thing it is doing; readers such as
+aitop list them. There is no daemon: the files are the bus, and `aibus ls`
+decides whether an entry is still alive when it reads it.
+
+  aibus put  SOURCE ID [--title T] [--ai A] [--state S] [--progress N/M] [--now TEXT]
+                       [--link NAME=PATH ...] [--pid PID] [--interval SEC] [--exit-code N]
+  aibus done SOURCE ID [--state S] [--exit-code N] [--now TEXT] [--link NAME=PATH ...] [--keep SEC]
+  aibus rm   SOURCE ID
+  aibus ls   [--json] [--all] [--source SOURCE] [--reader NAME]
+  aibus status [--json]
+  aibus gc   [--days N]
+"""
+import argparse
+import contextlib
+import fcntl
+import json
+import math
+import os
+import re
+import socket
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+__version__ = '0.1.0'
+SCHEMA = 1
+NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}')
+STATES = ('running', 'ok', 'warn', 'failed', 'finished')
+TERMINAL = ('failed', 'finished')
+KEEP = 24 * 3600
+# An interval job counts as late once two runs and a minute have gone by
+# without an update, so one slow run is not reported as stopped.
+GRACE = 60
+TEXT_LIMIT = 300
+
+
+def home():
+    return Path(os.environ.get('AIBUS_HOME') or Path.home() / '.local' / 'state' / 'aibus')
+
+
+def dir_problem(path):
+    """Why a folder must not be used, or None. Reading and writing both ask."""
+    if path.is_symlink():
+        return f'a symlink: {path}'
+    if not path.is_dir():
+        return f'not a directory: {path}'
+    if path.stat().st_uid != os.getuid():
+        return f'not owned by you: {path}'
+    return None
+
+
+def private_dir(path):
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    problem = dir_problem(path)
+    if problem:
+        raise SystemExit(f'aibus: refusing {problem}')
+    os.chmod(path, 0o700)
+
+
+def seconds(text):
+    """argparse type for a finite, non-negative number of seconds."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'not a number: {text!r}') from None
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f'must be a finite number of seconds, 0 or more: {text!r}')
+    return value
+
+
+def integer(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def finite(value):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # an int too large for a float
+        return False
+
+
+def entry_problem(data):
+    """Why a parsed entry cannot be trusted, or None.
+
+    Every field is optional except source and id, but a field that is there
+    must have the type and range put would have written.
+    """
+    if not isinstance(data, dict):
+        return 'not a JSON object'
+    for key in ('source', 'id'):
+        if not isinstance(data.get(key), str) or not NAME.fullmatch(data[key]):
+            return f'bad {key}'
+    checks = {
+        'started': lambda v: finite(v) and v >= 0,
+        'updated': lambda v: finite(v) and v >= 0,
+        'expires': lambda v: finite(v) and v >= 0,
+        'interval': lambda v: finite(v) and v > 0,
+        'pid': lambda v: integer(v) and v > 0,
+        'exit_code': integer,
+        'schema': integer,
+        'state': lambda v: v in STATES,
+        'ai': lambda v: isinstance(v, str) and NAME.fullmatch(v),
+        'title': lambda v: isinstance(v, str),
+        'now': lambda v: isinstance(v, str),
+        'host': lambda v: isinstance(v, str),
+        'progress': lambda v: (isinstance(v, list) and len(v) == 2 and all(integer(n) for n in v)
+                               and 0 <= v[0] <= v[1] and v[1] > 0),
+        'links': lambda v: (isinstance(v, dict) and all(isinstance(k, str) and NAME.fullmatch(k)
+                                                        and isinstance(t, str) for k, t in v.items())),
+    }
+    for key, ok in checks.items():
+        if key in data and not ok(data[key]):
+            return f'bad {key}'
+    return None
+
+
+def checked(kind, value):
+    if not NAME.fullmatch(value or ''):
+        raise SystemExit(f'aibus: {kind} must be 1-128 of A-Z a-z 0-9 . _ - and start with a letter or digit: {value!r}')
+    return value
+
+
+def entry_path(source, item):
+    return home() / checked('source', source) / (checked('id', item) + '.json')
+
+
+@contextlib.contextmanager
+def locked(folder):
+    """Serialise read-modify-write on one source, so two puts cannot lose a field."""
+    private_dir(home())
+    private_dir(folder)
+    fd = os.open(folder / '.lock', os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def no_constants(name):
+    raise ValueError(f'{name} is not valid JSON')
+
+
+def read(path):
+    try:
+        # json accepts NaN and Infinity by default; aibus never writes them.
+        data = json.loads(path.read_text(encoding='utf-8'), parse_constant=no_constants)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return False
+    return data if isinstance(data, dict) else False
+
+
+def write(path, data):
+    fd, name = tempfile.mkstemp(prefix='.' + path.name, dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
+            handle.write('\n')
+        os.replace(name, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(name)
+        raise
+
+
+def clip(text):
+    text = ' '.join(str(text).split())
+    return text if len(text) <= TEXT_LIMIT else text[:TEXT_LIMIT - 1] + '…'
+
+
+def progress(value):
+    match = re.fullmatch(r'(\d+)/(\d+)', value or '')
+    if not match or int(match.group(2)) == 0 or int(match.group(1)) > int(match.group(2)):
+        raise SystemExit(f'aibus: --progress takes N/M with 0 <= N <= M and M > 0: {value!r}')
+    return [int(match.group(1)), int(match.group(2))]
+
+
+def links(pairs):
+    result = {}
+    for pair in pairs or []:
+        name, sep, target = pair.partition('=')
+        if not sep or not NAME.fullmatch(name) or not target:
+            raise SystemExit(f'aibus: --link takes NAME=PATH: {pair!r}')
+        result[name] = target
+    return result
+
+
+def update(args, finishing):
+    path = entry_path(args.source, args.id)
+    with locked(path.parent):
+        if path.is_symlink():
+            raise SystemExit(f'aibus: refusing a symlinked entry: {path}')
+        data = read(path)
+        # A broken entry is left for a person to look at, not overwritten.
+        if data is False or (data is not None and entry_problem(data)):
+            raise SystemExit(f'aibus: {path} is unreadable or malformed; '
+                             f'run aibus rm {args.source} {args.id} to start it over')
+        data = data or {}
+        now = time.time()
+        if not data:
+            data = {'schema': SCHEMA, 'source': args.source, 'id': args.id, 'started': now,
+                    'host': socket.gethostname(), 'state': 'running'}
+        if getattr(args, 'title', None) is not None:
+            data['title'] = clip(args.title)
+        if getattr(args, 'ai', None) is not None:
+            data['ai'] = checked('ai', args.ai)
+        if args.state is not None:
+            data['state'] = args.state
+        if getattr(args, 'progress', None) is not None:
+            data['progress'] = progress(args.progress)
+        if args.now is not None:
+            data['now'] = clip(args.now)
+        if args.link:
+            data.setdefault('links', {}).update(links(args.link))
+        if getattr(args, 'pid', None) is not None:
+            data['pid'] = args.pid
+        if getattr(args, 'interval', None) is not None:
+            if args.interval <= 0:
+                raise SystemExit('aibus: --interval must be positive')
+            data['interval'] = args.interval
+        if args.exit_code is not None:
+            data['exit_code'] = args.exit_code
+        if finishing:
+            if args.state is None:
+                data['state'] = 'failed' if args.exit_code not in (None, 0) else 'finished'
+            data['expires'] = now + args.keep
+        data['updated'] = now
+        write(path, data)
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OverflowError:
+        return False
+    return True
+
+
+def judge(data, now):
+    """The state a reader should show, from what the file says and the clock."""
+    state = data.get('state', 'running')
+    if state in TERMINAL:
+        return state
+    pid = data.get('pid')
+    if isinstance(pid, int) and pid > 0 and not alive(pid):
+        return 'stopped'
+    interval = data.get('interval')
+    updated = data.get('updated')
+    if finite(interval) and finite(updated):
+        if now - updated > interval * 2 + GRACE:
+            return 'late'
+    return state
+
+
+def entries(source=None):
+    """Valid entries and warnings about everything skipped. Readers refuse the same folders writers do."""
+    root = home()
+    if not root.exists() and not root.is_symlink():
+        return [], []
+    problem = dir_problem(root)
+    if problem:
+        raise SystemExit(f'aibus: refusing {problem}')
+    found, warnings = [], []
+    try:
+        folders = sorted(root.iterdir())
+    except OSError as error:
+        raise SystemExit(f'aibus: cannot read {root}: {error.strerror}')
+    for folder in folders:
+        if source and folder.name != source:
+            continue
+        # Only names a source can have; .readers and other dot folders are aibus's own.
+        if not NAME.fullmatch(folder.name) or (not folder.is_dir() and not folder.is_symlink()):
+            continue
+        problem = dir_problem(folder)
+        if problem:
+            warnings.append(f'skipped {problem}')
+            continue
+        # glob hides a folder it cannot read, which would look like an empty bus.
+        try:
+            names = sorted(e.name for e in os.scandir(folder) if e.name.endswith('.json'))
+        except OSError as error:
+            warnings.append(f'cannot read {folder}: {error.strerror}')
+            continue
+        for path in (folder / name for name in names):
+            if path.is_symlink():
+                warnings.append(f'symlink skipped: {path}')
+                continue
+            data = read(path)
+            if data is None:
+                continue
+            problem = 'unreadable' if data is False else entry_problem(data)
+            if problem:
+                warnings.append(f'{problem}: {path}')
+                continue
+            found.append((path, data))
+    return found, warnings
+
+
+def expired_at(data, now):
+    expires = data.get('expires')
+    return finite(expires) and now > expires
+
+
+def listing(args):
+    now = time.time()
+    found, warnings = entries(checked('source', args.source) if args.source else None)
+    items = []
+    for _path, data in found:
+        expired = expired_at(data, now)
+        if expired and not args.all:
+            continue
+        row = dict(data)
+        row['status'] = judge(data, now)
+        row['expired'] = expired
+        items.append(row)
+    items.sort(key=lambda r: (r.get('source', ''), -(r.get('updated') or 0), r.get('id', '')))
+    return now, items, warnings
+
+
+def ago(seconds):
+    seconds = max(0, int(seconds))
+    for size, unit in ((86400, 'd'), (3600, 'h'), (60, 'm')):
+        if seconds >= size:
+            return f'{seconds // size}{unit}'
+    return f'{seconds}s'
+
+
+READERS = '.readers'
+# A viewer may read every second; its record is rewritten at most this often.
+READER_REFRESH = 10
+
+
+def record_reader(name):
+    """Note that NAME read the bus, for `aibus status`. A failure here never fails the read."""
+    path = home() / READERS / (name + '.json')
+    try:
+        if path.exists() and not path.is_symlink() and time.time() - path.stat().st_mtime < READER_REFRESH:
+            return
+        private_dir(home())
+        private_dir(path.parent)
+        if path.is_symlink():
+            return
+        write(path, {'reader': name, 'last_read': time.time(), 'pid': os.getpid()})
+    except (OSError, SystemExit):
+        pass
+
+
+def readers():
+    folder = home() / READERS
+    found = []
+    if folder.is_symlink() or not folder.is_dir():
+        return found
+    for path in sorted(folder.glob('*.json')):
+        data = None if path.is_symlink() else read(path)
+        if (isinstance(data, dict) and isinstance(data.get('reader'), str) and NAME.fullmatch(data['reader'])
+                and finite(data.get('last_read'))):
+            found.append(data)
+    return found
+
+
+def cmd_ls(args):
+    if args.reader:
+        checked('reader', args.reader)
+    now, items, warnings = listing(args)
+    if args.reader:
+        record_reader(args.reader)
+    if args.json:
+        json.dump({'aibus': __version__, 'schema': SCHEMA, 'now': now, 'items': items,
+                   'warnings': warnings}, sys.stdout, ensure_ascii=False, allow_nan=False)
+        sys.stdout.write('\n')
+        return 0
+    for warning in warnings:
+        print(f'warning: {warning}', file=sys.stderr)
+    if not items:
+        print('nothing on the bus')
+        return 0
+    print(f"{'SOURCE':12} {'ID':28} {'STATUS':12} {'UPDATED':>7}  NOW / TITLE")
+    for row in items:
+        status = row['status'] + (f"({row['exit_code']})" if row.get('exit_code') is not None else '')
+        text = row.get('now') or row.get('title') or ''
+        print(f"{row.get('source', ''):12.12} {row.get('id', ''):28.28} {status:12} "
+              f"{ago(now - (row.get('updated') or now)):>7}  {text}")
+    return 0
+
+
+def cmd_status(args):
+    """What is connected: the bus folder, every source that wrote, every reader that read."""
+    now, root = time.time(), home()
+    report = {'aibus': __version__, 'schema': SCHEMA, 'bus': str(root), 'problem': None,
+              'sources': [], 'readers': [], 'warnings': []}
+    exists = root.exists() or root.is_symlink()
+    if exists:
+        report['problem'] = dir_problem(root)
+    if exists and not report['problem']:
+        try:
+            found, report['warnings'] = entries()
+        except SystemExit as stop:
+            report['problem'], found = str(stop), []
+        sources = {}
+        for _path, data in found:
+            source = sources.setdefault(data['source'], {'source': data['source'], 'entries': 0,
+                                                          'last_write': 0, 'status': {}})
+            source['entries'] += 1
+            source['last_write'] = max(source['last_write'], data.get('updated') or 0)
+            status = 'expired' if expired_at(data, now) else judge(data, now)
+            source['status'][status] = source['status'].get(status, 0) + 1
+        report['sources'] = sorted(sources.values(), key=lambda s: s['source'])
+        report['readers'] = [{'reader': r['reader'], 'last_read': r['last_read']} for r in readers()]
+    if args.json:
+        json.dump(report, sys.stdout, ensure_ascii=False, allow_nan=False)
+        sys.stdout.write('\n')
+        return 1 if report['problem'] else 0
+    print(f"bus      {root}  " + (f"refusing {report['problem']}" if report['problem']
+                                  else 'ok' if exists else 'not created yet: nothing has reported'))
+    print(f'version  aibus {__version__}, schema {SCHEMA}')
+    print('writers')
+    for s in report['sources']:
+        counts = ', '.join(f'{k} {v}' for k, v in sorted(s['status'].items()))
+        noun = 'entry' if s['entries'] == 1 else 'entries'
+        print(f"  {s['source']:12.12} {s['entries']:>3} {noun:7}  last write {ago(now - s['last_write']):>4} ago  {counts}")
+    if not report['sources']:
+        print('  none: no tool has reported yet')
+    print('readers')
+    for r in report['readers']:
+        print(f"  {r['reader']:12.12} last read {ago(now - r['last_read']):>4} ago")
+    if not report['readers']:
+        print('  none: no viewer has read with --reader yet')
+    for warning in report['warnings']:
+        print(f'warning: {warning}')
+    return 1 if report['problem'] else 0
+
+
+def cmd_rm(args):
+    path = entry_path(args.source, args.id)
+    with locked(path.parent):
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+    return 0
+
+
+def stale(data, now, cutoff):
+    """Expired more than cutoff ago, or stopped or late with no update for cutoff."""
+    expires, updated = data.get('expires'), data.get('updated')
+    if finite(expires) and now - expires > cutoff:
+        return True
+    return (judge(data, now) in ('stopped', 'late') and finite(updated)
+            and now - updated > cutoff)
+
+
+def cmd_gc(args):
+    """Delete entries that expired, stopped or went late more than --days ago."""
+    cutoff = args.days * 86400
+    found, _ = entries()
+    removed = 0
+    for path, _data in found:
+        # Decide again under the lock: the tool may have updated the entry
+        # since it was listed, and a fresh entry must not be deleted.
+        with locked(path.parent):
+            if path.is_symlink():
+                continue
+            data = read(path)
+            if data and not entry_problem(data) and stale(data, time.time(), cutoff):
+                with contextlib.suppress(FileNotFoundError):
+                    path.unlink()
+                removed += 1
+    print(f'removed {removed}')
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog='aibus', description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--version', action='version', version=f'aibus {__version__}')
+    commands = parser.add_subparsers(dest='command', required=True)
+
+    put = commands.add_parser('put', help='create or update an entry')
+    done = commands.add_parser('done', help='mark an entry finished and let it expire')
+    for command in (put, done):
+        command.add_argument('source')
+        command.add_argument('id')
+        command.add_argument('--state', choices=STATES)
+        command.add_argument('--exit-code', type=int)
+        command.add_argument('--now', help='the latest line of output or a short status')
+        command.add_argument('--link', action='append', metavar='NAME=PATH')
+    put.add_argument('--title')
+    put.add_argument('--ai', help='claude, codex, or who else runs it')
+    put.add_argument('--progress', metavar='N/M')
+    put.add_argument('--pid', type=int, help='stopped once this process is gone')
+    put.add_argument('--interval', type=seconds, metavar='SEC', help='late once two intervals pass without an update')
+    put.set_defaults(func=lambda a: update(a, False) or 0)
+    done.add_argument('--keep', type=seconds, default=KEEP, metavar='SEC',
+                      help='how long ls still shows it (default one day)')
+    done.set_defaults(func=lambda a: update(a, True) or 0)
+
+    rm = commands.add_parser('rm', help='delete an entry')
+    rm.add_argument('source')
+    rm.add_argument('id')
+    rm.set_defaults(func=cmd_rm)
+
+    ls = commands.add_parser('ls', help='list entries with their judged status')
+    ls.add_argument('--json', action='store_true')
+    ls.add_argument('--all', action='store_true', help='include entries past their expiry')
+    ls.add_argument('--source')
+    ls.add_argument('--reader', metavar='NAME', help='record that NAME read the bus, for aibus status')
+    ls.set_defaults(func=cmd_ls)
+
+    status = commands.add_parser('status', help='show what is connected: the bus, its writers and readers')
+    status.add_argument('--json', action='store_true')
+    status.set_defaults(func=cmd_status)
+
+    gc = commands.add_parser('gc', help='delete old entries')
+    gc.add_argument('--days', type=seconds, default=7)
+    gc.set_defaults(func=cmd_gc)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
