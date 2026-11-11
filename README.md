@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/logo.svg" alt="" width="96">
+
 # aibus
 
 **A status board on disk for the tools that run next to your AI agents**
@@ -7,7 +9,7 @@
 Verifiers, scheduled checks and MCP servers each write one small file about what they are doing.<br>
 Viewers read one folder, and aibus tells them which entries are still alive.
 
-[![macOS | Linux](https://img.shields.io/badge/macOS%20%7C%20Linux-supported-555555)](#install)
+[![macOS | Linux | WSL](https://img.shields.io/badge/macOS%20%7C%20Linux%20%7C%20WSL-supported-555555)](#install)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)](aibus)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -37,46 +39,15 @@ aibus turns that around. Each tool reports itself with one command, and every vi
 - a scheduled job that misses two runs shows as `late`
 - finished work drops out of the default list after a day
 
-## How it works
-
-```mermaid
-flowchart LR
-  subgraph writers["Tools that report"]
-    V["verifier<br/>put --pid, then done"]
-    M["MCP server wrapper<br/>put --pid"]
-    J["scheduled job<br/>put --interval"]
-  end
-  F[("~/.local/state/aibus<br/>source/id.json")]
-  subgraph readers["Readers"]
-    L["aibus ls<br/>judges each entry"]
-    A["aitop, or your own viewer"]
-  end
-  V --> F
-  M --> F
-  J --> F
-  F --> L
-  L -- "--json" --> A
-```
-
-Writers never talk to readers. Each `put` or `done` rewrites one file under a lock, and `ls` reads the folder and decides what to show from the file and the clock:
-
-```mermaid
-stateDiagram-v2
-  direction LR
-  [*] --> running: put
-  running --> finished: done, exit 0
-  running --> failed: done, exit not 0
-  running --> stopped: its pid is gone
-  ok --> late: no update for two intervals and a minute
-  finished --> [*]: expires after --keep
-  failed --> [*]: expires after --keep
-```
-
-`stopped` and `late` are never written to the file. They are what `ls` concludes when the tool stopped reporting, so a tool that crashes or a job that no longer runs shows up without anyone having to notice.
-
 ## Install
 
-Python 3.9 or later on macOS or Linux, standard library only.
+macOS, with Homebrew:
+
+```sh
+brew install dor1a/tap/aibus
+```
+
+Linux and WSL, from a clone:
 
 ```sh
 git clone https://github.com/dor1a/aibus.git
@@ -84,7 +55,15 @@ cd aibus
 ./install.sh
 ```
 
-`install.sh` links `aibus` into `~/.local/bin`. To update, `git pull` in the clone.
+`install.sh` links `aibus` into `~/.local/bin` and says so when that folder is not on your `PATH`. If it is not, add it in your shell's rc file:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+To update, run `brew upgrade aibus`, or `git pull` in the clone.
+
+aibus needs Python 3.9 or later and uses only the standard library, so the macOS `/usr/bin/python3` is enough.
 
 ## Usage
 
@@ -113,7 +92,7 @@ Options for `put` (and, where it makes sense, `done`):
 | `--interval SEC` | How often a scheduled job reports. Two intervals and a minute without an update make it `late` |
 | `--exit-code N` | The exit code, shown next to the status |
 
-## Reporting from a script
+### Reporting from a script
 
 Status reporting should never break the tool that does it. Call aibus only when it is installed and ignore its exit code:
 
@@ -131,7 +110,9 @@ A job that runs on a timer reports with an interval instead of a process:
 report put mac slow-log --interval 300 --state ok --now "swap 1.2G, pressure normal"
 ```
 
-## Reading it
+launchd jobs and agent hooks run with a short `PATH` that may not include Homebrew, so a script run from them should also look for aibus in `/opt/homebrew/bin`, `/usr/local/bin` and `~/.local/bin`.
+
+### Reading it
 
 `aibus ls --json` prints one object that viewers can rely on:
 
@@ -171,6 +152,55 @@ Times are Unix seconds. Fields a tool never set are absent rather than `null`.
 
 A viewer should pass `--reader NAME` (aitop passes `--reader aitop`). aibus then notes when that viewer last read, at most every ten seconds, so `aibus status` can show it.
 
+## How it works
+
+```mermaid
+flowchart LR
+  subgraph writers["Tools that report"]
+    V["verifier<br/>put --pid, then done"]
+    M["MCP server wrapper<br/>put --pid"]
+    J["scheduled job<br/>put --interval"]
+  end
+  F[("~/.local/state/aibus<br/>source/id.json")]
+  subgraph readers["Readers"]
+    L["aibus ls<br/>judges each entry"]
+    A["aitop, or your own viewer"]
+  end
+  V --> F
+  M --> F
+  J --> F
+  F --> L
+  L -- "--json" --> A
+```
+
+Writers never talk to readers. Each `put` or `done` rewrites one file under a lock, and `ls` reads the folder and decides what to show from the file and the clock:
+
+```mermaid
+stateDiagram-v2
+  direction LR
+  [*] --> running: put
+  running --> finished: done, exit 0
+  running --> failed: done, exit not 0
+  running --> stopped: its pid is gone
+  ok --> late: no update for two intervals and a minute
+  finished --> [*]: expires after --keep
+  failed --> [*]: expires after --keep
+```
+
+`stopped` and `late` are never written to the file. They are what `ls` concludes when the tool stopped reporting, so a tool that crashes or a job that no longer runs shows up without anyone having to notice.
+
+### Where the files live
+
+| | |
+| -- | -- |
+| Folder | `~/.local/state/aibus/<source>/<id>.json`, or `$AIBUS_HOME` |
+| Permissions | Folders 700, files 600 |
+| Refused | A bus folder that is a symlink or belongs to someone else stops every command. A source folder like that is refused by `put`, `done` and `rm`, skipped with a warning by `ls`, and skipped without one by `gc`. Symlinked entries are skipped with a warning |
+| Broken entries | An entry is malformed when a field has the wrong type or range, for example `NaN`, a progress past its total or a negative interval. `ls` skips it with a warning, and `put` and `done` leave it alone and fail, so `aibus rm` is the way to start it over |
+| Writes | Each update holds a lock on its source folder and replaces the file atomically, so concurrent updates do not lose fields. `gc` decides again under the same lock, so it never deletes an entry that was just updated |
+
+Entries carry whatever text your tools put in them, such as file paths and command output. Keep secrets out of `--now` and `--link`.
+
 ## Troubleshooting
 
 When a viewer shows nothing, `aibus status` tells which side to look at:
@@ -195,17 +225,27 @@ readers
 
 `aibus status --json` prints the same as one object, and exits 1 when the bus folder is refused.
 
-## Where the files live
+## Uninstall
 
-| | |
-| -- | -- |
-| Folder | `~/.local/state/aibus/<source>/<id>.json`, or `$AIBUS_HOME` |
-| Permissions | Folders 700, files 600 |
-| Refused | A bus folder that is a symlink or belongs to someone else stops every command. A source folder like that is skipped with a warning, and so are symlinked entries |
-| Broken entries | An entry is malformed when a field has the wrong type or range, for example `NaN`, a progress past its total or a negative interval. `ls` skips it with a warning, and `put` and `done` leave it alone and fail, so `aibus rm` is the way to start it over |
-| Writes | Each update holds a lock on its source folder and replaces the file atomically, so concurrent updates do not lose fields. `gc` decides again under the same lock, so it never deletes an entry that was just updated |
+```sh
+brew uninstall aibus
+```
 
-Entries carry whatever text your tools put in them, such as file paths and command output. Keep secrets out of `--now` and `--link`.
+For a clone, remove the link and then the clone:
+
+```sh
+rm ~/.local/bin/aibus
+```
+
+The entries stay in `~/.local/state/aibus` (or `$AIBUS_HOME`) until you delete that folder.
+
+## Development
+
+The tests use only the standard library:
+
+```sh
+python3 -m unittest discover -s tests
+```
 
 ## License
 
