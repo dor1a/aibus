@@ -69,9 +69,9 @@ aibus needs Python 3.9 or later and uses only the standard library, so the macOS
 
 | Command | What it does |
 | -- | -- |
-| `aibus put SOURCE ID [options]` | Create the entry or update the fields you pass. The rest stay as they were |
+| `aibus put SOURCE ID [options]` | Create the entry or update the fields you pass. The rest stay as they were. A `--pid` other than the stored one starts the entry over, so a new process does not inherit the old run's start time, progress or exit code |
 | `aibus done SOURCE ID [--exit-code N] [--keep SEC]` | Mark it `finished`, or `failed` for a non-zero exit code, and keep showing it for a day (or `--keep` seconds) |
-| `aibus rm SOURCE ID` | Delete the entry |
+| `aibus rm SOURCE ID [--pid PID]` | Delete the entry. With `--pid`, delete it only if that process wrote it |
 | `aibus ls [--json] [--all] [--source S] [--reader NAME]` | List entries with their judged status. `--all` includes expired ones. `--reader` records who read, for `status` |
 | `aibus status [--json]` | Show what is connected: the bus folder, every source that wrote and every reader that read |
 | `aibus gc [--days N]` | Delete entries whose expiry passed more than N days ago, and `stopped` or `late` entries with no update for N days (default 7) |
@@ -88,7 +88,7 @@ Options for `put`. `done` also takes `--state`, `--progress`, `--now`, `--link` 
 | `--progress N/M` | Steps done out of the total |
 | `--now TEXT` | The latest line of output or a short status. Folded to one line, 300 characters at most |
 | `--link NAME=PATH` | A report, log or URL. Repeat for more |
-| `--pid PID` | The process doing the work. Once it is gone the entry is `stopped` |
+| `--pid PID` | The process doing the work, 1 or more. Once it is gone the entry is `stopped` |
 | `--interval SEC` | How often a scheduled job reports. Two intervals and a minute without an update make it `late` |
 | `--exit-code N` | The exit code, shown next to the status |
 
@@ -108,6 +108,14 @@ A job that runs on a timer reports with an interval instead of a process:
 
 ```sh
 report put mac slow-log --interval 300 --state ok --now "swap 1.2G, pressure normal"
+```
+
+A server that can be killed before it cleans up, such as an MCP server under an AI client, can leave the cleanup to a watcher that outlives it. The watcher should pass the server's pid, so it does not delete the entry of a newer server that has taken the same ID by then:
+
+```sh
+report put mcp wiki-1 --title "wiki server" --pid $$
+# later, from the watcher
+report rm mcp wiki-1 --pid "$server_pid"
 ```
 
 launchd jobs and agent hooks run with a short `PATH` that may not include Homebrew, so a script run from them should also look for aibus in `/opt/homebrew/bin`, `/usr/local/bin` and `~/.local/bin`.

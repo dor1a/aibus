@@ -158,6 +158,78 @@ class Safety(Base):
             run('put', 'job', 'a')
 
 
+class PidRuns(Base):
+    def put_old_run(self):
+        run('put', 'mcp', 'slot-1', '--title', 'server', '--pid', str(os.getpid()),
+            '--progress', '2/4', '--now', 'old line', '--exit-code', '3')
+        path = self.home / 'mcp' / 'slot-1.json'
+        data = json.loads(path.read_text())
+        data['started'] -= 8 * 3600
+        path.write_text(json.dumps(data))
+        return data['started']
+
+    def test_put_with_another_pid_starts_over(self):
+        old_started = self.put_old_run()
+        before = time.time()
+        run('put', 'mcp', 'slot-1', '--title', 'server', '--pid', str(os.getpid() + 1))
+        row = ls()[('mcp', 'slot-1')]
+        self.assertGreaterEqual(row['started'], before)
+        self.assertGreater(row['started'], old_started)
+        self.assertEqual(row['pid'], os.getpid() + 1)
+        self.assertEqual(row['title'], 'server')
+        for gone in ('progress', 'now', 'exit_code'):
+            self.assertNotIn(gone, row)
+
+    def test_put_with_the_same_pid_or_none_keeps_the_run(self):
+        old_started = self.put_old_run()
+        run('put', 'mcp', 'slot-1', '--pid', str(os.getpid()), '--now', 'new line')
+        run('put', 'mcp', 'slot-1', '--progress', '3/4')
+        row = ls()[('mcp', 'slot-1')]
+        self.assertEqual(row['started'], old_started)
+        self.assertEqual(row['now'], 'new line')
+        self.assertEqual(row['progress'], [3, 4])
+        self.assertEqual(row['exit_code'], 3)
+
+    def test_rm_with_pid_removes_only_that_run(self):
+        run('put', 'mcp', 'slot-1', '--pid', str(os.getpid()))
+        path = self.home / 'mcp' / 'slot-1.json'
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, _ = run('rm', 'mcp', 'slot-1', '--pid', str(os.getpid() + 1))
+        self.assertEqual(code, 0)
+        self.assertTrue(path.exists())
+        self.assertIn('left in place', err.getvalue())
+        code, _ = run('rm', 'mcp', 'slot-1', '--pid', str(os.getpid()))
+        self.assertEqual(code, 0)
+        self.assertFalse(path.exists())
+        self.assertEqual(run('rm', 'mcp', 'slot-1', '--pid', '1')[0], 0)
+
+    def test_put_refuses_a_pid_below_one(self):
+        with self.assertRaises(SystemExit):
+            run('put', 'mcp', 'slot-1', '--pid', '0')
+        self.assertFalse((self.home / 'mcp' / 'slot-1.json').exists())
+
+    def test_rm_with_pid_leaves_entries_it_cannot_read(self):
+        (self.home / 'mcp').mkdir(parents=True, mode=0o700)
+        path = self.home / 'mcp' / 'slot-1.json'
+        path.write_text('{broken')
+        with contextlib.redirect_stderr(io.StringIO()):
+            run('rm', 'mcp', 'slot-1', '--pid', str(os.getpid()))
+        self.assertTrue(path.exists())
+        run('put', 'mcp', 'slot-2')
+        with contextlib.redirect_stderr(io.StringIO()):
+            run('rm', 'mcp', 'slot-2', '--pid', str(os.getpid()))
+        self.assertTrue((self.home / 'mcp' / 'slot-2.json').exists())
+        # Valid JSON with a bad field is malformed too, even when the pid matches.
+        for name, data in (('slot-3', {'source': 'mcp', 'id': 'slot-3', 'pid': 123, 'progress': [9, 2]}),
+                           ('slot-4', {'source': 'mcp', 'id': 'slot-4', 'pid': True})):
+            path = self.home / 'mcp' / f'{name}.json'
+            path.write_text(json.dumps(data))
+            with contextlib.redirect_stderr(io.StringIO()):
+                run('rm', 'mcp', name, '--pid', str(data['pid'] if name == 'slot-3' else 1))
+            self.assertTrue(path.exists(), name)
+
+
 class Cleanup(Base):
     def test_rm_and_gc(self):
         run('put', 'job', 'keep')

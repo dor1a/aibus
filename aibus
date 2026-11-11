@@ -8,7 +8,7 @@ decides whether an entry is still alive when it reads it.
   aibus put  SOURCE ID [--title T] [--ai A] [--state S] [--progress N/M] [--now TEXT]
                        [--link NAME=PATH ...] [--pid PID] [--interval SEC] [--exit-code N]
   aibus done SOURCE ID [--state S] [--exit-code N] [--progress N/M] [--now TEXT] [--link NAME=PATH ...] [--keep SEC]
-  aibus rm   SOURCE ID
+  aibus rm   SOURCE ID [--pid PID]
   aibus ls   [--json] [--all] [--source SOURCE] [--reader NAME]
   aibus status [--json]
   aibus gc   [--days N]
@@ -26,7 +26,7 @@ import tempfile
 import time
 from pathlib import Path
 
-__version__ = '0.1.1'
+__version__ = '0.1.2'
 SCHEMA = 1
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}')
 STATES = ('running', 'ok', 'warn', 'failed', 'finished')
@@ -204,6 +204,13 @@ def update(args, finishing):
             raise SystemExit(f'aibus: {path} is unreadable or malformed; '
                              f'run aibus rm {args.source} {args.id} to start it over')
         data = data or {}
+        # Another process under the same ID is a new run: keeping the old fields
+        # would carry over its start time, progress and exit code.
+        new_pid = getattr(args, 'pid', None)
+        if new_pid is not None and new_pid <= 0:
+            raise SystemExit('aibus: --pid must be positive')
+        if data and new_pid is not None and data.get('pid') not in (None, new_pid):
+            data = {}
         now = time.time()
         if not data:
             data = {'schema': SCHEMA, 'source': args.source, 'id': args.id, 'started': now,
@@ -445,6 +452,16 @@ def cmd_status(args):
 def cmd_rm(args):
     path = entry_path(args.source, args.id)
     with locked(path.parent):
+        # With --pid, delete only an entry that process wrote, so a late cleanup
+        # cannot remove the entry of a newer process that took the same ID.
+        if args.pid is not None:
+            data = read(path)
+            if data is None:
+                return 0
+            if not data or entry_problem(data) or data.get('pid') != args.pid:
+                print(f'aibus: {args.source}/{args.id} is not from pid {args.pid}; left in place',
+                      file=sys.stderr)
+                return 0
         with contextlib.suppress(FileNotFoundError):
             path.unlink()
     return 0
@@ -507,6 +524,7 @@ def main(argv=None):
     rm = commands.add_parser('rm', help='delete an entry')
     rm.add_argument('source')
     rm.add_argument('id')
+    rm.add_argument('--pid', type=int, help='delete only if this process wrote the entry')
     rm.set_defaults(func=cmd_rm)
 
     ls = commands.add_parser('ls', help='list entries with their judged status')
