@@ -221,7 +221,7 @@ readers
 | `refusing` on the `bus` line | The bus folder itself: a symlink, someone else's folder, or not a folder. Every command stops until it is fixed |
 | A tool missing under `writers` | The tool is not reporting. Run its `aibus put` by hand: aibus may not be on the `PATH` the tool runs with (launchd and hooks have a short one), and a wrapper that ignores aibus errors hides that |
 | Writers fine, the viewer missing under `readers` or its last read long ago | The viewer is not reading: it is not running, aibus is not on its `PATH`, or it does not pass `--reader` |
-| Both fine, still nothing on screen | The viewer's own filter, such as aitop's `--ai` or hidden ended records |
+| Both fine, still nothing on screen | The viewer's own filter, such as aitop's `--ai`, or aitop keeping ended records and entries that last reported `ok` behind `l` |
 
 `aibus status --json` prints the same as one object, and exits 1 when the bus folder is refused.
 
