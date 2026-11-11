@@ -7,7 +7,7 @@ decides whether an entry is still alive when it reads it.
 
   aibus put  SOURCE ID [--title T] [--ai A] [--state S] [--progress N/M] [--now TEXT]
                        [--link NAME=PATH ...] [--pid PID] [--interval SEC] [--exit-code N]
-  aibus done SOURCE ID [--state S] [--exit-code N] [--now TEXT] [--link NAME=PATH ...] [--keep SEC]
+  aibus done SOURCE ID [--state S] [--exit-code N] [--progress N/M] [--now TEXT] [--link NAME=PATH ...] [--keep SEC]
   aibus rm   SOURCE ID
   aibus ls   [--json] [--all] [--source SOURCE] [--reader NAME]
   aibus status [--json]
@@ -26,7 +26,7 @@ import tempfile
 import time
 from pathlib import Path
 
-__version__ = '0.1.0'
+__version__ = '0.1.1'
 SCHEMA = 1
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}')
 STATES = ('running', 'ok', 'warn', 'failed', 'finished')
@@ -492,11 +492,11 @@ def main(argv=None):
         command.add_argument('id')
         command.add_argument('--state', choices=STATES)
         command.add_argument('--exit-code', type=int)
+        command.add_argument('--progress', metavar='N/M')
         command.add_argument('--now', help='the latest line of output or a short status')
         command.add_argument('--link', action='append', metavar='NAME=PATH')
     put.add_argument('--title')
     put.add_argument('--ai', help='claude, codex, or who else runs it')
-    put.add_argument('--progress', metavar='N/M')
     put.add_argument('--pid', type=int, help='stopped once this process is gone')
     put.add_argument('--interval', type=seconds, metavar='SEC', help='late once two intervals pass without an update')
     put.set_defaults(func=lambda a: update(a, False) or 0)

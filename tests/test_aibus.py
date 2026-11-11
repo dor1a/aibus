@@ -62,6 +62,16 @@ class PutAndDone(Base):
         run('done', 'job', 'a', '--exit-code', '0')
         self.assertEqual(ls()[('job', 'a')]['status'], 'finished')
 
+    def test_done_records_final_progress(self):
+        run('put', 'job', 'a', '--progress', '3/5')
+        run('done', 'job', 'a', '--progress', '5/5', '--now', 'all steps done')
+        row = ls()[('job', 'a')]
+        self.assertEqual(row['progress'], [5, 5])
+        self.assertEqual(row['now'], 'all steps done')
+        self.assertEqual(row['status'], 'finished')
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            run('done', 'job', 'a', '--progress', '6/5')
+
     def test_expired_entries_hide_unless_all(self):
         run('put', 'job', 'a')
         run('done', 'job', 'a', '--keep', '0')

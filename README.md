@@ -78,7 +78,7 @@ aibus needs Python 3.9 or later and uses only the standard library, so the macOS
 
 `SOURCE` groups entries, for example `xverify`, `mcp` or `mac`. `SOURCE` and `ID` take letters, digits, `.`, `_` and `-`, start with a letter or digit, and are at most 128 characters.
 
-Options for `put` (and, where it makes sense, `done`):
+Options for `put`. `done` also takes `--state`, `--progress`, `--now`, `--link` and `--exit-code`, so the last step count and output line can go in with the final status:
 
 | Option | Field |
 | -- | -- |
